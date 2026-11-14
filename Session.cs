@@ -60,10 +60,19 @@ internal static partial class Session
         AutoJoinTick();
         HostReloadTick();
         JoinPendingTick();
+        QueuedJoinTick();
         if (IsGuest) knownHost = Lobby.Owner;
+        else if (!IsInLobby) knownHost = 0;
         HostGoneTick();
         ConnectionTick();
         if (Lobby.Status == LobbyStatus.Hosting) SendHost();
+    }
+
+    private static void QueuedJoinTick()
+    {
+        if (joinQueue.Count == 0 || !IsHost || WorldShip.Busy) return;
+        if (WorldShip.PendingSaveReason() != null) return;
+        StartNextJoin();
     }
 
     public static bool IsInLobby
@@ -250,11 +259,15 @@ internal static partial class Session
     public static void WorldRequested(ulong guest)
     {
         CoopLog.Log.Info("join world requested by " + DisplayName(guest) + " (" + guest + ")");
-        if (!WorldShip.Busy)
+        // While the host is still loading or saving, the game refuses a fresh save.
+        // Queue the guest and start the ticket once the save can run.
+        string wait = GameRefs.AreaId == null ? null : WorldShip.PendingSaveReason();
+        if (!WorldShip.Busy && wait == null)
         {
             StartJoin(guest);
             return;
         }
+        if (wait != null) CoopLog.Log.Info("coop: join of " + guest + " waits, " + wait);
         if (!joinQueue.Contains(guest)) joinQueue.Enqueue(guest);
         Ack(guest, true, "queued");
     }
@@ -358,12 +371,20 @@ internal static partial class Session
 
     private static void OnMemberLeft(ulong id)
     {
-        if (IsGuest && id == knownHost) MarkHostLeft();
+        if (WasGuest && id == knownHost) MarkHostLeft();
     }
 
     private static void OnOwnerChanged(ulong previous, ulong owner)
     {
-        if (IsGuest && previous != 0 && owner != 0) MarkHostLeft();
+        if (WasGuest && previous != 0 && owner != 0) MarkHostLeft();
+    }
+
+    // When the host quits, Steam hands the lobby to the guest and the status turns to
+    // Hosting before these events run, so IsGuest is already false. Remember the role
+    // through the host this machine last followed instead.
+    private static bool WasGuest
+    {
+        get { return IsGuest || (knownHost != 0 && knownHost != Me); }
     }
 
     internal static string WorldIdFor(string owner)

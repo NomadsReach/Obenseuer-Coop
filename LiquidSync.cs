@@ -28,6 +28,7 @@ internal static partial class LiquidSync
     private static readonly Dictionary<string, List<string>> groups = new Dictionary<string, List<string>>();
     private static readonly Dictionary<string, string> unapplied = new Dictionary<string, string>();
     private static readonly Dictionary<string, string> baseline = new Dictionary<string, string>();
+    private static float pendingAtSeen;
     private static readonly Dictionary<string, string> discarded = new Dictionary<string, string>();
 
     public static void Install(Harmony harmony)
@@ -79,15 +80,24 @@ internal static partial class LiquidSync
             }
             if (!Follower) return true;
             if (open == tank) return true;
-            if (pending != null && Time.unscaledTime - pendingAt < 10f) return false;
+            if (pending != null && Time.unscaledTime - pendingAt < 10f)
+            {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid click ignored, a lease is pending for " + (Time.unscaledTime - pendingAt).ToString("0.0") + " s");
+                return false;
+            }
             if (open != null) CloseRunning();
-            if (unsent.Count != 0) return false;
+            if (unsent.Count != 0)
+            {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid click ignored, " + unsent.Count + " tank state(s) still wait to be sent back");
+                return false;
+            }
             leaseAuthority = FreeRoam.Authority;
             leaseScene = GameRefs.AreaId;
             pending = tank;
             pendingKey = key;
             pendingAt = Time.unscaledTime;
             Session.Send(FreeRoam.Authority, Channel, "LQREQ|" + GameRefs.AreaId + "|" + key, true);
+            if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid lease asked of " + FreeRoam.Authority + ", open " + (open != null) + ", unsent " + unsent.Count);
             CoopNotice.Show("liquid|wait", "Waiting for the host...", 2f);
             return false;
         }
@@ -117,6 +127,7 @@ internal static partial class LiquidSync
             if (key == null) return;
             if (open == __instance)
             {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid tank closed on the guest, menu visible " + (GameUIController.instance != null && GameUIController.instance.IsMenuVisible) + ", current is this " + (LiquidStorage.currentStorage == __instance));
                 open = null;
                 openKey = null;
                 unsent[key] = Time.unscaledTime + 30f;
@@ -174,6 +185,16 @@ internal static partial class LiquidSync
             ResendTick();
             float now = Time.realtimeSinceStartup;
             if (open != null && (LiquidStorage.currentStorage != open || GameUIController.instance == null || !GameUIController.instance.IsMenuVisible)) ExitPostfix(open);
+            // The host's own open is only cleared by ExitExternally. When its menu closes by
+            // another path the tank stayed marked as in use and the guest was told
+            // "The host is using this" until a later click.
+            if (hostOpen != null && FreeRoam.IAmAuthority && (LiquidStorage.currentStorage != hostOpen || GameUIController.instance == null || !GameUIController.instance.IsMenuVisible))
+            {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", "liquid", "the host tank menu is closed, the host open mark is cleared");
+                LiquidStorage stale = hostOpen;
+                ExitPostfix(stale);
+                if (hostOpen == stale) hostOpen = null;
+            }
             if (open != null && openKey != null && now >= touchAt)
             {
                 touchAt = now + 30f;
@@ -185,6 +206,7 @@ internal static partial class LiquidSync
                 pending = null;
                 pendingKey = null;
                 CoopNotice.Show("liquid|no", "The tank did not open, try again", 3f);
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", "liquid", "no lease came back within 10 s, the request was dropped");
             }
             if (FreeRoam.IAmAuthority)
             {
@@ -228,6 +250,7 @@ internal static partial class LiquidSync
             else if (f[0] == "LQTOUCH" && FreeRoam.IAmAuthority) Touch(from, f[2]);
             else if (f[0] == "LQNO" && from == FreeRoam.Authority && f[2] == pendingKey)
             {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", f[2], "liquid lease refused by the host: " + (f.Length > 3 ? f[3] : "?"));
                 pending = null;
                 pendingKey = null;
                 CoopNotice.Show("liquid|no", f.Length > 3 ? f[3] : "Not available", 3f);
@@ -367,11 +390,13 @@ internal static partial class LiquidSync
             {
                 LiquidStorage tank = pending;
                 string key = pendingKey;
+                pendingAtSeen = pendingAt;
                 pending = null;
                 pendingKey = null;
                 leaseNames[key] = name;
                 if (!ApplyAll(tank, key, json))
                 {
+                    if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid lease state could not be applied, the lease is handed back");
                     Session.Send(leaseAuthority, Channel, "LQCLOSE|" + GameRefs.AreaId + "|" + key + "|0", true);
                     return;
                 }
@@ -380,7 +405,22 @@ internal static partial class LiquidSync
                 openKey = key;
                 touchAt = 0f;
                 reentry = true;
-                try { tank.UseStorage(); }
+                try
+                {
+                    tank.UseStorage();
+                    // The lease arrives a few frames after the click, when the game no longer
+                    // treats it as a fresh use, so UseStorage can leave the menu closed and the
+                    // player had to click again. Open it the way LockUse does if it stayed shut.
+                    GameUIController ui = GameUIController.instance;
+                    bool shown = LiquidStorage.currentStorage == tank && ui != null && ui.IsMenuVisible;
+                    if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "liquid lease arrived after " + (Time.unscaledTime - pendingAtSeen).ToString("0.0") + " s, UseStorage left the menu " + (shown ? "open" : "closed"));
+                    if (!shown && (tank._Lock == null || !tank._Lock.Locked))
+                    {
+                        if (InteractObjects.instance != null) InteractObjects.instance.lastUsedInteractable = tank;
+                        tank.EnterExternally(true);
+                        if (CoopDebug.On("cont")) CoopDebug.Event("cont", key, "the leased tank was opened with forceOpen, UseStorage left the menu closed");
+                    }
+                }
                 finally { reentry = false; }
                 return;
             }
@@ -532,7 +572,16 @@ internal static partial class LiquidSync
             ulong holder;
             if (Holds(group[i], out holder)) return Session.DisplayName(holder) + " is using this";
             LiquidStorage t = Find(group[i]);
-            if (unapplied.ContainsKey(group[i]) || (guest && t != null && (hostOpen == t || HostUses(t)))) return "The host is using this";
+            if (unapplied.ContainsKey(group[i]))
+            {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", group[i], "liquid lease refused, the guest's last state is not applied yet");
+                return "The host is still saving your last change, try again";
+            }
+            if (guest && t != null && (hostOpen == t || HostUses(t)))
+            {
+                if (CoopDebug.On("cont")) CoopDebug.Event("cont", group[i], "liquid lease refused, the host has the tank open");
+                return "The host is using this";
+            }
         }
         return null;
     }
